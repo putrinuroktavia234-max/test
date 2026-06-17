@@ -6805,17 +6805,74 @@ SUDOEOF
 }
 
 _ordervpn_setup_nginx() {
-    local PORT="${1:-8888}"
-    local SUB="${2:-}"
+    local SUB="${1:-}"
     local DIR="/var/www/html/ordervpn"
     local PHP_SOCK=""
     for sock in /var/run/php/php*.fpm.sock; do [[ -S "$sock" ]] && { PHP_SOCK="unix:$sock"; break; }; done
     [[ -z "$PHP_SOCK" ]] && PHP_SOCK="unix:/var/run/php/php8.1-fpm.sock"
-    cat > /etc/nginx/sites-available/ordervpn << NGINXEOF
+
+    # Bersihkan konfigurasi lama port 8888 jika ada
+    rm -f /etc/nginx/sites-enabled/ordervpn /etc/nginx/sites-available/ordervpn
+
+    # Buat location block config untuk include di main nginx port 80 & 443
+    cat > /etc/nginx/ordervpn-location.conf << 'CONFEOF'
+location /ordervpn {
+    alias /var/www/html/ordervpn;
+    index index.php;
+    charset utf-8;
+    client_max_body_size 5M;
+    try_files $uri $uri/ /ordervpn/index.php?$query_string;
+
+    location ~ /includes/ { deny all; }
+    location ~ /cron/     { deny all; }
+    location ~ /\.ht      { deny all; }
+
+    location ~ \.php$ {
+        try_files $uri =404;
+        fastcgi_split_path_info ^(.+\.php)(/.+)$;
+        fastcgi_pass PHP_SOCK_PLACEHOLDER;
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME $request_filename;
+        include fastcgi_params;
+        fastcgi_read_timeout 120;
+    }
+}
+CONFEOF
+
+    # Ganti placeholder PHP socket
+    sed -i "s|PHP_SOCK_PLACEHOLDER|${PHP_SOCK}|" /etc/nginx/ordervpn-location.conf
+
+    # Inject include directive ke main nginx config (port 80 & 443)
+    if ! grep -q "include /etc/nginx/ordervpn-location.conf" /etc/nginx/sites-available/default 2>/dev/null; then
+        python3 -c "
+import re
+config_path = '/etc/nginx/sites-available/default'
+with open(config_path, 'r') as f:
+    content = f.read()
+
+# Sisipkan include sebelum penutup } server block
+old = '''    location / {
+        try_files \$uri \$uri/ /index.html;
+    }
+}'''
+new = '''    location / {
+        try_files \$uri \$uri/ /index.html;
+    }
+
+    include /etc/nginx/ordervpn-location.conf;
+}'''
+content = content.replace(old, new)
+with open(config_path, 'w') as f:
+    f.write(content)
+" 2>/dev/null || true
+    fi
+
+    # Jika subdomain disediakan, buat server block khusus
+    if [[ -n "$SUB" ]]; then
+        cat > /etc/nginx/sites-available/ordervpn-domain << NGINXEOF2
 server {
-    listen ${PORT};
-    listen [::]:${PORT};
-    server_name _;
+    listen 80;
+    server_name ${SUB};
     root ${DIR};
     index index.php;
     charset utf-8;
@@ -6826,7 +6883,7 @@ server {
     location / { try_files \$uri \$uri/ /index.php?\$query_string; }
     location ~ \.php$ {
         try_files \$uri =404;
-        fastcgi_split_path_info ^(.+\.php)(/.+)\$;
+        fastcgi_split_path_info ^(.+\.php)(/.+)$;
         fastcgi_pass ${PHP_SOCK};
         fastcgi_index index.php;
         fastcgi_param SCRIPT_FILENAME \$realpath_root\$fastcgi_script_name;
@@ -6834,7 +6891,43 @@ server {
         fastcgi_read_timeout 120;
     }
 }
-NGINXEOF
+NGINXEOF2
+        ln -sf /etc/nginx/sites-available/ordervpn-domain /etc/nginx/sites-enabled/ordervpn-domain 2>/dev/null
+
+        # HTTPS untuk subdomain
+        if [[ -f /etc/xray/xray.crt ]]; then
+            cat > /etc/nginx/sites-available/ordervpn-domain-ssl << SSLNGXEOF
+server {
+    listen 443 ssl http2;
+    server_name ${SUB};
+    ssl_certificate     /etc/xray/xray.crt;
+    ssl_certificate_key /etc/xray/xray.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    root ${DIR};
+    index index.php;
+    charset utf-8;
+    client_max_body_size 5M;
+    location ~ /includes/ { deny all; }
+    location ~ /cron/     { deny all; }
+    location ~ /\.ht      { deny all; }
+    location / { try_files \$uri \$uri/ /index.php?\$query_string; }
+    location ~ \.php$ {
+        try_files \$uri =404;
+        fastcgi_split_path_info ^(.+\.php)(/.+)$;
+        fastcgi_pass ${PHP_SOCK};
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME \$realpath_root\$fastcgi_script_name;
+        include fastcgi_params;
+        fastcgi_read_timeout 120;
+    }
+}
+SSLNGXEOF
+            ln -sf /etc/nginx/sites-available/ordervpn-domain-ssl /etc/nginx/sites-enabled/ordervpn-domain-ssl 2>/dev/null
+        fi
+    fi
+    nginx -t && systemctl reload nginx 2>/dev/null || true
+}NGINXEOF
     ln -sf /etc/nginx/sites-available/ordervpn /etc/nginx/sites-enabled/ordervpn 2>/dev/null
     if [[ -n "$SUB" ]]; then
         cat > /etc/nginx/sites-available/ordervpn-domain << NGINXEOF2
@@ -6912,16 +7005,16 @@ menu_ordervpn() {
         [[ -n "$DOMAIN" ]] && DISPLAY_HOST="$DOMAIN"
         if [[ -f /var/www/html/ordervpn/index.php ]]; then
             printf "  Status : ${GREEN}✔ Terinstall${NC}\n"
-            printf "  URL    : ${CYAN}http://%s:8888${NC}\n" "$DISPLAY_HOST"
+            printf "  URL    : ${CYAN}http://%s/ordervpn${NC}\n" "$DISPLAY_HOST"
+            printf "  URL    : ${CYAN}https://%s/ordervpn${NC}\n" "$DISPLAY_HOST"
         echo -e "  ${RED}⚠ Ganti password admin default! Pilih menu [9] di bawah.${NC}"
-            [[ -n "$DOMAIN" ]] && printf "  Domain : ${CYAN}http://%s${NC} (jika sudah setup subdomain)\n" "$DOMAIN"
         else
             printf "  Status : ${RED}✘ Belum diinstall${NC}\n"
         fi
         echo ""
         printf "  ${WHITE}[1]${NC} Install / Reinstall OrderVPN\n"
         printf "  ${WHITE}[2]${NC} Test vpn-api bridge + cek DB\n"
-        printf "  ${WHITE}[3]${NC} Restart PHP-FPM + Nginx (port 8888)\n"
+        printf "  ${WHITE}[3]${NC} Restart PHP-FPM + Nginx\n"
         printf "  ${WHITE}[4]${NC} Lihat log instalasi\n"
         printf "  ${WHITE}[5]${NC} Setup subdomain custom\n"
         printf "  ${WHITE}[6]${NC} Uninstall OrderVPN\n"
@@ -7002,7 +7095,7 @@ menu_ordervpn() {
                     sleep 2
                 else
                     printf "  ${CYAN}▸${NC} Setup nginx untuk %s...\n" "$subdomain"
-                    if _ordervpn_setup_nginx 8888 "$subdomain"; then
+                    if _ordervpn_setup_nginx "$subdomain"; then
                         echo -e "  ${GREEN}✔ Subdomain $subdomain berhasil disetup${NC}"
                         printf "  ${DIM}Pastikan DNS subdomain sudah mengarah ke IP: %s${NC}\n" "$IP_NOW"
                     else
@@ -7062,6 +7155,29 @@ menu_ordervpn() {
                     echo -e "  ${DIM}Coba install ulang (opsi 1) untuk membuat ulang file ini.${NC}"
                 fi
                 echo ""; read -rp "  Tekan ENTER..." ;;
+            9)
+                clear; print_menu_header "GANTI PASSWORD ADMIN"
+                read -rp "  Password baru: " new_admin_pass
+                if [[ -z "$new_admin_pass" || ${#new_admin_pass} -lt 6 ]]; then
+                    echo -e "  ${RED}✘ Password minimal 6 karakter!${NC}"
+                else
+                    if [[ -f /root/.ordervpn_db ]]; then
+                        source /root/.ordervpn_db 2>/dev/null
+                        ADMIN_HASH=$(php -r "echo password_hash('$new_admin_pass', PASSWORD_BCRYPT);" 2>/dev/null)
+                        if [[ -n "$ADMIN_HASH" ]]; then
+                            mysql -u"$DB_USER" -p"$DB_PASS" "$DB_NAME" -e "UPDATE users SET password='$ADMIN_HASH' WHERE username='admin';" 2>/dev/null
+                            echo "$new_admin_pass" > /root/.ordervpn_admin
+                            chmod 600 /root/.ordervpn_admin
+                            echo -e "  ${GREEN}✔ Password admin berhasil diganti!${NC}"
+                            echo -e "  ${WHITE}Password baru: ${GREEN}$new_admin_pass${NC}"
+                        else
+                            echo -e "  ${RED}✘ Gagal hash password! Pastikan PHP terinstall.${NC}"
+                        fi
+                    else
+                        echo -e "  ${RED}✘ File kredensial DB tidak ditemukan.${NC}"
+                    fi
+                fi
+                echo ""; read -rp "  Tekan ENTER..." ;;
             0) return ;;
         esac
     done
@@ -7076,7 +7192,7 @@ _ordervpn_install() {
     printf "  ${DIM}1. Install PHP, MySQL (jika belum)${NC}\n"
     printf "  ${DIM}2. Deploy web OrderVPN ke /var/www/html/ordervpn${NC}\n"
     printf "  ${DIM}3. Pasang vpn-api bridge (sync tunnel.sh)${NC}\n"
-    printf "  ${DIM}4. Setup Nginx port 8888${NC}\n"
+    printf "  ${DIM}4. Setup Nginx location /ordervpn (port 80/443)${NC}\n"
     printf "  ${DIM}5. Setup database otomatis${NC}\n"
     echo ""
     read -rp "  Lanjut? [y/N]: " confirm
@@ -7155,15 +7271,10 @@ SQLEOF2
     printf "  ${GREEN}✔${NC} vpn-api OK\n"
 
     # Nginx
-    printf "  ${CYAN}▸${NC} Setup Nginx port 8888...\n"
-    _ordervpn_setup_nginx 8888 "$SUBDOMAIN"
+    printf "  ${CYAN}▸${NC} Setup Nginx location /ordervpn...\n"
+    _ordervpn_setup_nginx "$SUBDOMAIN"
     printf "  ${GREEN}✔${NC} Nginx OK\n"
-
-    # UFW - buka port 8888
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "active"; then
-        ufw allow 8888/tcp >/dev/null 2>&1
-        printf "  ${GREEN}✔${NC} UFW port 8888 dibuka\n"
-    fi
+    printf "  ${GREEN}✔${NC} Panel via http://domain/ordervpn atau https://domain/ordervpn\n"
 
     # Cron
     local cl="0 * * * * php /var/www/html/ordervpn/cron/expire_accounts.php >> /var/log/ordervpn_cron.log 2>&1"
@@ -7189,8 +7300,9 @@ CREDEOF
     printf "  ${GREEN}╚══════════════════════════════════════════════╝${NC}\n"
     echo ""
     echo -e "  ${RED}⚠ PENTING! Ganti password admin via menu [9] atau web panel /change_password.php${NC}"
-    printf "  ${WHITE}URL Panel   :${NC} ${CYAN}http://%s:8888${NC}\n" "$IP_VPS"
-    [[ -n "$SUBDOMAIN" ]] && printf "  ${WHITE}Subdomain   :${NC} ${CYAN}http://%s${NC}\n" "$SUBDOMAIN"
+    printf "  ${WHITE}URL Panel   :${NC} ${CYAN}http://%s/ordervpn${NC}\n" "$IP_VPS"
+    printf "  ${WHITE}URL HTTPS  :${NC} ${CYAN}https://%s/ordervpn${NC}\n" "$IP_VPS"
+    [[ -n "$SUBDOMAIN" ]] && printf "  ${WHITE}Subdomain   :${NC} ${CYAN}http://%s${NC} (setup DNS A record)\n" "$SUBDOMAIN"
     if [[ -f /root/.ordervpn_admin ]]; then
         local ap; ap=$(cat /root/.ordervpn_admin)
         printf "  ${WHITE}Admin Login :${NC} admin / ${GREEN}%s${NC}\n" "$ap"
