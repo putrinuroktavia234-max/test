@@ -1,0 +1,4 @@
+DB_HOST=localhost
+DB_USER=ordervpn
+DB_PASS=bGo5zufQLvbSEvQh
+DB_NAME=ordervpn_db
