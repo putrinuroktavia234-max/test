@@ -434,7 +434,6 @@ print_section() {
 # Baca CPU dari /proc/stat (jauh lebih cepat dari top -bn1)
 _get_cpu_usage() {
     local idle1 total1 idle2 total2 diff_idle diff_total
-    read -r _ < /proc/stat  # skip first line or parse
     # Baca total dan idle dari baris pertama /proc/stat
     local cpu_line
     cpu_line=$(head -1 /proc/stat 2>/dev/null || echo "cpu 0 0 0 0 0 0 0 0 0 0")
@@ -526,9 +525,9 @@ show_system_info() {
             fi
         done
 
-        # Cache hasil ke file
-        printf "ip_vps='%s'\nram_used='%s'\nram_total='%s'\nram_pct='%s'\ncpu='%s'\nuptime_str='%s'\nssl_type='%s'\nsvc_total='%s'\nsvc_running='%s'\n" \
-            "$ip_vps" "$ram_used" "$ram_total" "$ram_pct" "$cpu" "$uptime_str" "$ssl_type" "$svc_total" "$svc_running" \
+        # Cache hasil ke file (termasuk active_units untuk service status)
+        printf "ip_vps='%s'\nram_used='%s'\nram_total='%s'\nram_pct='%s'\ncpu='%s'\nuptime_str='%s'\nssl_type='%s'\nsvc_total='%s'\nsvc_running='%s'\nactive_units='%s'\n" \
+            "$ip_vps" "$ram_used" "$ram_total" "$ram_pct" "$cpu" "$uptime_str" "$ssl_type" "$svc_total" "$svc_running" "$active_units" \
             > "$SYSTEM_INFO_CACHE" 2>/dev/null
     fi
 
@@ -574,8 +573,10 @@ show_system_info() {
 
     # ── NETWORK SERVICES ──
     local xs xn hs dn ss un ks bt fb cj fw
-    local active_units
-    active_units=$(_get_services_status)
+    if [ -z "${active_units:-}" ]; then
+        local active_units
+        active_units=$(_get_services_status)
+    fi
     local _svc_on() { echo "$active_units" | grep -q "${1}\.service|"; }
     _svc_on xray          && xs="${GREEN}● ONLINE${NC}" || xs="${RED}○ OFFLINE${NC}"
     _svc_on nginx         && xn="${GREEN}● ONLINE${NC}" || xn="${RED}○ OFFLINE${NC}"
