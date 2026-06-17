@@ -579,7 +579,7 @@ show_system_info() {
         local active_units
         active_units=$(_get_services_status)
     fi
-    local _svc_on() { echo "$active_units" | grep -q "${1}\.service|"; }
+    _svc_on() { echo "$active_units" | grep -q "${1}\.service|"; }
     _svc_on xray          && xs="${GREEN}● ONLINE${NC}" || xs="${RED}○ OFFLINE${NC}"
     _svc_on nginx         && xn="${GREEN}● ONLINE${NC}" || xn="${RED}○ OFFLINE${NC}"
     _svc_on haproxy       && hs="${GREEN}● ONLINE${NC}" || hs="${RED}○ OFFLINE${NC}"
