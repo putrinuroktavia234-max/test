@@ -1,0 +1,25 @@
+# Sensitive files
+.bash_history
+.cache/
+.config/
+.npm/
+.profile
+.ssh/
+.wget-hsts
+.cloud-locale-test.skip
+
+# Bot & payment credentials
+/bot/
+/orders/
+/akun/
+/root/.bot_token
+/root/.chat_id
+/root/.payment_info
+/root/.ip_vps
+/root/.domain_type
+/root/.svc_reg
+
+# Temp files
+/tmp/
+*.bak
+*.swp
