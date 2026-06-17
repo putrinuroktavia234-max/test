@@ -6755,6 +6755,13 @@ DBEOF
 _ordervpn_deploy_files() {
     local DIR="/var/www/html/ordervpn"
     local DB_PASS="$1"
+
+    # If .ordervpn_db exists, use password from there (reinstall scenario)
+    if [[ -f /root/.ordervpn_db ]]; then
+        source /root/.ordervpn_db
+        echo -e "  ${YELLOW}Menggunakan DB_PASS dari /root/.ordervpn_db${NC}"
+    fi
+
     mkdir -p "$DIR"/{includes,api,cron,uploads/bukti,assets/{css,js,img}}
 
     # Ensure unzip is available
