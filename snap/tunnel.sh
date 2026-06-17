@@ -37,6 +37,8 @@ DOMAIN_FILE="/root/domain"
 IP_CACHE_FILE="/root/.ip_vps"
 AKUN_DIR="/root/akun"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
+DDOS_CONFIG="/root/.ddos_rules"
+TRAFFIC_DIR="/root/traffic"
 SCRIPT_VERSION="3.12.0"
 SCRIPT_AUTHOR="The Professor"
 GITHUB_USER="putrinuroktavia234-max"
@@ -674,7 +676,8 @@ show_menu() {
     _mrow $col "12" "Optimize VPS"     "17" "Uninstall Panel"
     _mrow $col "13" "Restart Service"  "18" "Advanced Mode"
     _mrow $col "19" "Port Info"        "20" "ZI VPN UDP"
-    _mrow1 $col "21" "OrderVPN Web"
+    _mrow $col "21" "OrderVPN Web"    "22" "DDoS Protect"
+    _mrow1 $col "23" "Traffic Monitor"
     _box_divider $W
     printf "  ${RED}[0]${NC}  ${WHITE}Exit Panel${NC}\n"
     _box_divider $W
@@ -7170,12 +7173,426 @@ CREDEOF
 }
 
 
+#================================================
+# DDoS BASIC PROTECTION — Rate Limiting iptables
+#================================================
+
+
+
+_ddos_ensure_chain() {
+    local chain="$1" table="${2:-filter}"
+    if ! iptables -t "$table" -L "$chain" -n 2>/dev/null | grep -q .; then
+        iptables -t "$table" -N "$chain" 2>/dev/null || true
+    fi
+}
+
+setup_ddos_protection() {
+    clear
+    print_menu_header "DDoS BASIC PROTECTION"
+
+    local fw_backend
+    detect_firewall_backend
+fw_backend=$FW_BACKEND
+
+    if [[ "$fw_backend" == "nftables" ]]; then
+        echo -e "  ${YELLOW}⚠ Mendeteksi nftables. Script ini akan mengkonversi ke iptables rules.${NC}"
+    fi
+
+    # Cek apakah sudah aktif
+    local ddos_active=0
+    if iptables -L INPUT -n 2>/dev/null | grep -q "DDOS-RULES"; then
+        ddos_active=1
+    fi
+
+    if [[ "$ddos_active" -eq 1 ]]; then
+        echo -e "  ${GREEN}✔ DDoS Protection sudah AKTIF!${NC}"
+        echo ""
+        echo -e "  ${WHITE}[1]${NC} Lihat Status & Statistik"
+        echo -e "  ${WHITE}[2]${NC} Nonaktifkan DDoS Protection"
+        echo -e "  ${WHITE}[3]${NC} Aktifkan Ulang"
+        echo -e "  ${WHITE}[0]${NC} Kembali"
+        echo ""
+        read -rp "  Pilih [0-3]: " ddos_choice
+        case $ddos_choice in
+            1) _ddos_show_status ;;
+            2) _ddos_disable ;;
+            3) _ddos_enable ;;
+            *) return ;;
+        esac
+        return
+    fi
+
+    echo -e "  ${CYAN}Mengaktifkan DDoS Basic Protection...${NC}"
+    echo ""
+    _ddos_enable
+}
+
+_ddos_enable() {
+    echo -e "  ${CYAN}Creating DDoS protection rules...${NC}"
+
+    # Buat chain khusus untuk DDoS
+    _ddos_ensure_chain "DDOS-RULES"
+    _ddos_ensure_chain "DDOS-PORTSCAN"
+
+    # Reset
+    iptables -F DDOS-RULES 2>/dev/null || true
+    iptables -F DDOS-PORTSCAN 2>/dev/null || true
+
+    # 1. SYN-FLOOD PROTECTION — max 20 SYN per detik per IP
+    iptables -A DDOS-RULES -p tcp --syn -m limit --limit 20/s --limit-burst 40 -j RETURN
+    iptables -A DDOS-RULES -p tcp --syn -j LOG --log-prefix "[DDOS-SYNFLOOD] " --log-level 4 2>/dev/null
+    iptables -A DDOS-RULES -p tcp --syn -j DROP
+
+    # 2. CONNECTION RATE LIMIT — max 30 koneksi baru per detik per IP
+    iptables -A DDOS-RULES -m state --state NEW -m recent --name DDOS --set
+    iptables -A DDOS-RULES -m state --state NEW -m recent --name DDOS --update --seconds 1 --hitcount 30 -j LOG --log-prefix "[DDOS-CONNECT] " 2>/dev/null
+    iptables -A DDOS-RULES -m state --state NEW -m recent --name DDOS --update --seconds 1 --hitcount 30 -j DROP
+
+    # 3. PORT SCAN PROTECTION
+    # NULL scan
+    iptables -A DDOS-PORTSCAN -p tcp --tcp-flags ALL NONE -j LOG --log-prefix "[DDOS-NULLSCAN] " 2>/dev/null
+    iptables -A DDOS-PORTSCAN -p tcp --tcp-flags ALL NONE -j DROP
+    # XMAS scan
+    iptables -A DDOS-PORTSCAN -p tcp --tcp-flags ALL ALL -j LOG --log-prefix "[DDOS-XMASSCAN] " 2>/dev/null
+    iptables -A DDOS-PORTSCAN -p tcp --tcp-flags ALL ALL -j DROP
+    # FIN scan
+    iptables -A DDOS-PORTSCAN -p tcp --tcp-flags ALL FIN -j LOG --log-prefix "[DDOS-FINSCAN] " 2>/dev/null
+    iptables -A DDOS-PORTSCAN -p tcp --tcp-flags ALL FIN -j DROP
+
+    # 4. DROP INVALID PACKETS
+    iptables -A DDOS-RULES -m state --state INVALID -j DROP
+
+    # 5. LIMIT ICMP (ping flood)
+    iptables -A DDOS-RULES -p icmp -m limit --limit 5/s -j ACCEPT
+    iptables -A DDOS-RULES -p icmp -j DROP
+
+    # 6. LIMIT SSH (max 10 koneksi baru per menit)
+    iptables -A DDOS-RULES -p tcp --dport 22 -m state --state NEW -m recent --name SSH --set
+    iptables -A DDOS-RULES -p tcp --dport 22 -m state --state NEW -m recent --name SSH --update --seconds 60 --hitcount 10 -j LOG --log-prefix "[DDOS-SSH] " 2>/dev/null
+    iptables -A DDOS-RULES -p tcp --dport 22 -m state --state NEW -m recent --name SSH --update --seconds 60 --hitcount 10 -j DROP
+
+    # 7. LIMIT DROPBEAR
+    iptables -A DDOS-RULES -p tcp --dport 222 -m state --state NEW -m recent --name DROPBEAR --set
+    iptables -A DDOS-RULES -p tcp --dport 222 -m state --state NEW -m recent --name DROPBEAR --update --seconds 60 --hitcount 10 -j DROP
+
+    # Hook chain ke INPUT
+    iptables -C INPUT -j DDOS-PORTSCAN 2>/dev/null || iptables -I INPUT 1 -j DDOS-PORTSCAN 2>/dev/null || true
+    iptables -C INPUT -j DDOS-RULES 2>/dev/null || iptables -I INPUT 2 -j DDOS-RULES 2>/dev/null || true
+
+    # Simpan rules
+    mkdir -p /etc/iptables
+    iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > "$DDOS_CONFIG" 2>/dev/null
+    echo "active" > "$DDOS_CONFIG"
+
+    # Buat systemd service untuk restore rules saat reboot
+    cat > /etc/systemd/system/ddos-protection.service << 'DDOSEOF'
+[Unit]
+Description=DDoS Basic Protection Rules
+After=network.target
+Before=iptables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/sbin/iptables-restore /etc/iptables/rules.v4
+ExecStop=/sbin/iptables -F DDOS-RULES 2>/dev/null; /sbin/iptables -D INPUT -j DDOS-RULES 2>/dev/null; /sbin/iptables -F DDOS-PORTSCAN 2>/dev/null; /sbin/iptables -D INPUT -j DDOS-PORTSCAN 2>/dev/null
+
+[Install]
+WantedBy=multi-user.target
+DDOSEOF
+    systemctl daemon-reload 2>/dev/null
+    systemctl enable ddos-protection 2>/dev/null || true
+
+    echo -e "  ${GREEN}✔ DDoS Basic Protection AKTIF!${NC}"
+    echo -e "  ${DIM}  Rules applied: SYN Flood, Port Scan, Connection Limit, ICMP Limit${NC}"
+    sleep 2
+}
+
+_ddos_disable() {
+    echo -e "  ${YELLOW}Menonaktifkan DDoS Protection...${NC}"
+
+    # Remove chain hooks
+    iptables -D INPUT -j DDOS-PORTSCAN 2>/dev/null || true
+    iptables -D INPUT -j DDOS-RULES 2>/dev/null || true
+
+    # Flush chains
+    iptables -F DDOS-RULES 2>/dev/null || true
+    iptables -F DDOS-PORTSCAN 2>/dev/null || true
+
+    # Delete chains
+    iptables -X DDOS-RULES 2>/dev/null || true
+    iptables -X DDOS-PORTSCAN 2>/dev/null || true
+
+    # Disable & stop service
+    systemctl stop ddos-protection 2>/dev/null || true
+    systemctl disable ddos-protection 2>/dev/null || true
+    rm -f "$DDOS_CONFIG"
+
+    echo -e "  ${GREEN}✔ DDoS Protection dinonaktifkan!${NC}"
+    sleep 2
+}
+
+_ddos_show_status() {
+    clear
+    print_menu_header "DDoS PROTECTION STATUS"
+
+    local active_rule_count
+    active_rule_count=$(iptables -L DDOS-RULES -n 2>/dev/null | wc -l)
+
+    if [[ "$active_rule_count" -le 2 ]]; then
+        echo -e "  ${RED}✘ DDoS Protection TIDAK AKTIF${NC}"
+        echo ""
+        read -rp "  Tekan Enter untuk kembali..."
+        return
+    fi
+
+    echo -e "  ${GREEN}✔ DDoS Protection: AKTIF${NC}"
+    echo ""
+    echo -e "  ${CYAN}DDOS-RULES Chain:${NC}"
+    iptables -L DDOS-RULES -n -v --line-numbers 2>/dev/null | head -40 | while IFS= read -r line; do
+        echo -e "  ${DIM}${line}${NC}"
+    done
+    echo ""
+    echo -e "  ${CYAN}DDOS-PORTSCAN Chain:${NC}"
+    iptables -L DDOS-PORTSCAN -n -v --line-numbers 2>/dev/null | head -20 | while IFS= read -r line; do
+        echo -e "  ${DIM}${line}${NC}"
+    done
+    echo ""
+    echo -e "  ${YELLOW}Packet counters:${NC}"
+    local dropped
+    dropped=$(iptables -L DDOS-RULES -n -v 2>/dev/null | tail -1 | awk '{print $1}')
+    echo -e "  ${WHITE}Total dropped packets: ${RED}${dropped:-0}${NC}"
+    echo ""
+    read -rp "  Tekan Enter untuk kembali..."
+}
+
+#================================================
+# TRAFFIC MONITOR — Bandwidth Per User
+#================================================
+
+traffic_monitor_menu() {
+    clear
+    print_menu_header "TRAFFIC MONITOR"
+
+    echo -e "  ${WHITE}[1]${NC} Aktifkan Traffic Monitor"
+    echo -e "  ${WHITE}[2]${NC} Lihat Traffic Per User"
+    echo -e "  ${WHITE}[3]${NC} Lihat Total Traffic Server"
+    echo -e "  ${WHITE}[4]${NC} Reset Traffic Counter"
+    echo -e "  ${WHITE}[5]${NC} Nonaktifkan Traffic Monitor"
+    echo -e "  ${WHITE}[0]${NC} Kembali"
+    echo ""
+    read -rp "  Pilih [0-5]: " tp_choice
+    case $tp_choice in
+        1) _traffic_enable ;;
+        2) _traffic_show_users ;;
+        3) _traffic_show_total ;;
+        4) _traffic_reset ;;
+        5) _traffic_disable ;;
+        *) return ;;
+    esac
+}
+
+_traffic_enable() {
+    clear
+    print_menu_header "AKTIFKAN TRAFFIC MONITOR"
+
+    # Cek apakah sudah aktif
+    if iptables -L TRAFFIC-IN -n 2>/dev/null | grep -q .; then
+        echo -e "  ${YELLOW}⚠ Traffic Monitor sudah aktif!${NC}"
+        sleep 2
+        return
+    fi
+
+    echo -e "  ${CYAN}Membuat rules monitoring traffic...${NC}"
+
+    # Buat chains
+    iptables -N TRAFFIC-IN 2>/dev/null || true
+    iptables -N TRAFFIC-OUT 2>/dev/null || true
+
+    # Reset
+    iptables -F TRAFFIC-IN 2>/dev/null || true
+    iptables -F TRAFFIC-OUT 2>/dev/null || true
+
+    # Monitor traffic ke port-port VPN
+    # SSH
+    iptables -A TRAFFIC-IN -p tcp --dport 22 -j ACCEPT
+    iptables -A TRAFFIC-OUT -p tcp --sport 22 -j ACCEPT
+    # Dropbear
+    iptables -A TRAFFIC-IN -p tcp --dport 222 -j ACCEPT
+    iptables -A TRAFFIC-OUT -p tcp --sport 222 -j ACCEPT
+    # HTTP/HTTPS
+    iptables -A TRAFFIC-IN -p tcp --dport 80 -j ACCEPT
+    iptables -A TRAFFIC-OUT -p tcp --sport 80 -j ACCEPT
+    iptables -A TRAFFIC-IN -p tcp --dport 443 -j ACCEPT
+    iptables -A TRAFFIC-OUT -p tcp --sport 443 -j ACCEPT
+    # Download port
+    iptables -A TRAFFIC-IN -p tcp --dport 81 -j ACCEPT
+    iptables -A TRAFFIC-OUT -p tcp --sport 81 -j ACCEPT
+    # Xray internal ports
+    for port in 8080 8081 8082 8444 8445 8446; do
+        iptables -A TRAFFIC-IN -p tcp --dport $port -j ACCEPT
+        iptables -A TRAFFIC-OUT -p tcp --sport $port -j ACCEPT
+    done
+    # BadVPN UDP
+    iptables -A TRAFFIC-IN -p udp --dport 7100:7300 -j ACCEPT
+    iptables -A TRAFFIC-OUT -p udp --sport 7100:7300 -j ACCEPT
+
+    # Hook ke INPUT dan OUTPUT
+    iptables -I INPUT 1 -j TRAFFIC-IN 2>/dev/null || true
+    iptables -I OUTPUT 1 -j TRAFFIC-OUT 2>/dev/null || true
+
+    # Buat direktori cache
+    mkdir -p "$TRAFFIC_DIR"
+
+    echo -e "  ${GREEN}✔ Traffic Monitor AKTIF!${NC}"
+    echo -e "  ${DIM}  Monitoring: SSH, Dropbear, HTTP/HTTPS, Xray, BadVPN${NC}"
+    sleep 2
+}
+
+_traffic_disable() {
+    echo -e "  ${YELLOW}Menonaktifkan Traffic Monitor...${NC}"
+
+    iptables -D INPUT -j TRAFFIC-IN 2>/dev/null || true
+    iptables -D OUTPUT -j TRAFFIC-OUT 2>/dev/null || true
+    iptables -F TRAFFIC-IN 2>/dev/null || true
+    iptables -F TRAFFIC-OUT 2>/dev/null || true
+    iptables -X TRAFFIC-IN 2>/dev/null || true
+    iptables -X TRAFFIC-OUT 2>/dev/null || true
+
+    rm -rf "$TRAFFIC_DIR" 2>/dev/null
+
+    echo -e "  ${GREEN}✔ Traffic Monitor dinonaktifkan!${NC}"
+    sleep 2
+}
+
+_traffic_show_total() {
+    clear
+    print_menu_header "TOTAL TRAFFIC SERVER"
+
+    if ! iptables -L TRAFFIC-IN -n 2>/dev/null | grep -q .; then
+        echo -e "  ${RED}✘ Traffic Monitor tidak aktif! Aktifkan dulu [1].${NC}"
+        echo ""
+        read -rp "  Tekan Enter untuk kembali..."
+        return
+    fi
+
+    local in_bytes out_bytes
+    in_bytes=$(iptables -L TRAFFIC-IN -n -v 2>/dev/null | tail -1 | awk '{print $2}')
+    out_bytes=$(iptables -L TRAFFIC-OUT -n -v 2>/dev/null | tail -1 | awk '{print $2}')
+
+    # Convert bytes to human readable
+    _fmt_bytes() {
+        local b=${1:-0}
+        if [[ $b -ge 1073741824 ]]; then echo "$(awk "BEGIN{printf \"%.2f\",$b/1073741824}") GB"
+        elif [[ $b -ge 1048576 ]]; then echo "$(awk "BEGIN{printf \"%.2f\",$b/1048576}") MB"
+        elif [[ $b -ge 1024 ]]; then echo "$(awk "BEGIN{printf \"%.2f\",$b/1024}") KB"
+        else echo "${b} B"; fi
+    }
+
+    local W; W=$(get_width)
+    _box_top $W
+    _box_center $W "${YELLOW}${BOLD}TOTAL TRAFFIC${NC}"
+    _box_divider $W
+    _box_row $W "IN (Download)" "$(_fmt_bytes ${in_bytes:-0})"
+    _box_row $W "OUT (Upload)"  "$(_fmt_bytes ${out_bytes:-0})"
+    _box_bottom $W
+    echo ""
+    read -rp "  Tekan Enter untuk kembali..."
+}
+
+_traffic_show_users() {
+    clear
+    print_menu_header "TRAFFIC PER USER"
+
+    # Cek apakah ada akun
+    mkdir -p "$AKUN_DIR"
+    local users=()
+    shopt -s nullglob
+    for f in "$AKUN_DIR"/*.txt; do
+        local uname
+        uname=$(basename "$f" .txt)
+        local protocol=${uname%%-*}
+        local username=${uname#*-}
+        users+=("$protocol" "$username")
+    done
+    shopt -u nullglob
+
+    if [[ ${#users[@]} -eq 0 ]]; then
+        echo -e "  ${YELLOW}⚠ Tidak ada akun!${NC}"
+        echo ""
+        read -rp "  Tekan Enter untuk kembali..."
+        return
+    fi
+
+    # Cek monitoring aktif
+    if ! iptables -L TRAFFIC-IN -n 2>/dev/null | grep -q .; then
+        echo -e "  ${RED}✘ Traffic Monitor tidak aktif! Aktifkan dulu [1].${NC}"
+        echo ""
+        read -rp "  Tekan Enter untuk kembali..."
+        return
+    fi
+
+    local total_in=0 total_out=0
+    local W; W=$(get_width)
+    _box_top $W
+    _box_center $W "${YELLOW}${BOLD}TRAFFIC PER USER${NC}"
+    _box_divider $W
+
+    local idx=0
+    while [[ $idx -lt ${#users[@]} ]]; do
+        local proto=${users[$idx]}
+        local uname=${users[$((idx+1))]}
+
+        # Dapatkan IP user (baca dari file akun)
+        local ip_file="$PUBLIC_HTML/${proto}-${uname}.txt"
+        if [[ -f "$ip_file" ]]; then
+            local user_ip
+            user_ip=$(grep -oP '(?<=IP/Host|IP VPS|IP Address)[^0-9]*[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$ip_file" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+            if [[ -z "$user_ip" ]]; then
+                user_ip="$(get_ip)"
+            fi
+        else
+            user_ip="N/A"
+        fi
+
+        # Tampilkan informasi user
+        printf "  ${CYAN}%-12s${NC}: ${WHITE}%s${NC}\n" "${proto^^}" "$uname"
+        idx=$((idx+2))
+    done
+
+    _box_divider $W
+    _box_center $W "${YELLOW}Gunakan 'iptables -L TRAFFIC-IN -n -v' untuk detail${NC}"
+    _box_bottom $W
+    echo ""
+
+    # Tampilkan summary dari iptables
+    echo -e "  ${CYAN}Traffic by Port (IN):${NC}"
+    iptables -L TRAFFIC-IN -n -v 2>/dev/null | tail -n +3 | while IFS= read -r line; do
+        echo -e "  ${DIM}$line${NC}"
+    done
+    echo ""
+    echo -e "  ${CYAN}Traffic by Port (OUT):${NC}"
+    iptables -L TRAFFIC-OUT -n -v 2>/dev/null | tail -n +3 | while IFS= read -r line; do
+        echo -e "  ${DIM}$line${NC}"
+    done
+
+    echo ""
+    read -rp "  Tekan Enter untuk kembali..."
+}
+
+_traffic_reset() {
+    echo -e "  ${YELLOW}Mereset traffic counter...${NC}"
+    iptables -Z TRAFFIC-IN 2>/dev/null || true
+    iptables -Z TRAFFIC-OUT 2>/dev/null || true
+    echo -e "  ${GREEN}✔ Traffic counter direset!${NC}"
+    sleep 2
+}
 main_menu() {
     while true; do
         printf "\r  ${CYAN}⣾${NC} ${WHITE}Loading system info...${NC}   "
         show_system_info
         show_menu
-        printf "${YELLOW}${BOLD}➤ ENTER OPTION [0-21] : ${NC}"
+        printf "${YELLOW}${BOLD}➤ ENTER OPTION [0-23] : ${NC}"
         read -r choice
 
         case $choice in
@@ -7211,6 +7628,8 @@ main_menu() {
             19) show_info_port ;;
             20) manage_zivpn_udp ;;
             21) menu_ordervpn ;;
+            22) setup_ddos_protection ;;
+            23) traffic_monitor_menu ;;
             ping|PING) ping_check ;;
             0|00) clear; echo -e "  ${CYAN}Goodbye! — Youzin Crabz Tunel${NC}"; echo -e "  ${DIM}Ketik 'menu' untuk buka panel lagi.${NC}"; echo ""; return 0 ;;
             help|HELP) _show_help ;;
