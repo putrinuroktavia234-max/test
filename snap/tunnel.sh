@@ -7192,10 +7192,10 @@ setup_ddos_protection() {
 
     local fw_backend
     detect_firewall_backend
-fw_backend=$FW_BACKEND
+    fw_backend=$FW_BACKEND
 
     if [[ "$fw_backend" == "nftables" ]]; then
-        echo -e "  ${YELLOW}⚠ Mendeteksi nftables. Script ini akan mengkonversi ke iptables rules.${NC}"
+        echo -e "  ${YELLOW}Mendeteksi nftables. Script ini akan mengkonversi ke iptables rules.${NC}"
     fi
 
     # Cek apakah sudah aktif
@@ -7205,18 +7205,20 @@ fw_backend=$FW_BACKEND
     fi
 
     if [[ "$ddos_active" -eq 1 ]]; then
-        echo -e "  ${GREEN}✔ DDoS Protection sudah AKTIF!${NC}"
+        echo -e "  ${GREEN}DDoS Protection sudah AKTIF!${NC}"
         echo ""
         echo -e "  ${WHITE}[1]${NC} Lihat Status & Statistik"
-        echo -e "  ${WHITE}[2]${NC} Nonaktifkan DDoS Protection"
-        echo -e "  ${WHITE}[3]${NC} Aktifkan Ulang"
+        echo -e "  ${WHITE}[2]${NC} Konfigurasi Threshold"
+        echo -e "  ${WHITE}[3]${NC} Nonaktifkan DDoS Protection"
+        echo -e "  ${WHITE}[4]${NC} Aktifkan Ulang"
         echo -e "  ${WHITE}[0]${NC} Kembali"
         echo ""
-        read -rp "  Pilih [0-3]: " ddos_choice
+        read -rp "  Pilih [0-4]: " ddos_choice
         case $ddos_choice in
             1) _ddos_show_status ;;
-            2) _ddos_disable ;;
-            3) _ddos_enable ;;
+            2) _ddos_config_menu ;;
+            3) _ddos_disable ;;
+            4) _ddos_enable ;;
             *) return ;;
         esac
         return
@@ -7226,9 +7228,25 @@ fw_backend=$FW_BACKEND
     echo ""
     _ddos_enable
 }
-
 _ddos_enable() {
     echo -e "  ${CYAN}Creating DDoS protection rules...${NC}"
+
+    # Baca konfigurasi threshold dari file (atau gunakan default)
+    local SYN_LIMIT=20 SYN_BURST=40 CONN_LIMIT=30 ICMP_LIMIT=5
+    local SSH_LIMIT=10 SSH_WINDOW=60 DROPBEAR_LIMIT=10 DROPBEAR_WINDOW=60
+
+    if [[ -f "$DDOS_CONFIG" ]]; then
+        local cfg
+        cfg=$(cat "$DDOS_CONFIG")
+        [[ "$cfg" =~ SYN_LIMIT=([0-9]+) ]]   && SYN_LIMIT=${BASH_REMATCH[1]}
+        [[ "$cfg" =~ SYN_BURST=([0-9]+) ]]  && SYN_BURST=${BASH_REMATCH[1]}
+        [[ "$cfg" =~ CONN_LIMIT=([0-9]+) ]]  && CONN_LIMIT=${BASH_REMATCH[1]}
+        [[ "$cfg" =~ ICMP_LIMIT=([0-9]+) ]]  && ICMP_LIMIT=${BASH_REMATCH[1]}
+        [[ "$cfg" =~ SSH_LIMIT=([0-9]+) ]]   && SSH_LIMIT=${BASH_REMATCH[1]}
+        [[ "$cfg" =~ SSH_WINDOW=([0-9]+) ]]  && SSH_WINDOW=${BASH_REMATCH[1]}
+        [[ "$cfg" =~ DROPBEAR_LIMIT=([0-9]+) ]] && DROPBEAR_LIMIT=${BASH_REMATCH[1]}
+        [[ "$cfg" =~ DROPBEAR_WINDOW=([0-9]+) ]] && DROPBEAR_WINDOW=${BASH_REMATCH[1]}
+    fi
 
     # Buat chain khusus untuk DDoS
     _ddos_ensure_chain "DDOS-RULES"
@@ -7238,24 +7256,21 @@ _ddos_enable() {
     iptables -F DDOS-RULES 2>/dev/null || true
     iptables -F DDOS-PORTSCAN 2>/dev/null || true
 
-    # 1. SYN-FLOOD PROTECTION — max 20 SYN per detik per IP
-    iptables -A DDOS-RULES -p tcp --syn -m limit --limit 20/s --limit-burst 40 -j RETURN
+    # 1. SYN-FLOOD PROTECTION
+    iptables -A DDOS-RULES -p tcp --syn -m limit --limit ${SYN_LIMIT}/s --limit-burst ${SYN_BURST} -j RETURN
     iptables -A DDOS-RULES -p tcp --syn -j LOG --log-prefix "[DDOS-SYNFLOOD] " --log-level 4 2>/dev/null
     iptables -A DDOS-RULES -p tcp --syn -j DROP
 
-    # 2. CONNECTION RATE LIMIT — max 30 koneksi baru per detik per IP
+    # 2. CONNECTION RATE LIMIT
     iptables -A DDOS-RULES -m state --state NEW -m recent --name DDOS --set
-    iptables -A DDOS-RULES -m state --state NEW -m recent --name DDOS --update --seconds 1 --hitcount 30 -j LOG --log-prefix "[DDOS-CONNECT] " 2>/dev/null
-    iptables -A DDOS-RULES -m state --state NEW -m recent --name DDOS --update --seconds 1 --hitcount 30 -j DROP
+    iptables -A DDOS-RULES -m state --state NEW -m recent --name DDOS --update --seconds 1 --hitcount ${CONN_LIMIT} -j LOG --log-prefix "[DDOS-CONNECT] " 2>/dev/null
+    iptables -A DDOS-RULES -m state --state NEW -m recent --name DDOS --update --seconds 1 --hitcount ${CONN_LIMIT} -j DROP
 
     # 3. PORT SCAN PROTECTION
-    # NULL scan
     iptables -A DDOS-PORTSCAN -p tcp --tcp-flags ALL NONE -j LOG --log-prefix "[DDOS-NULLSCAN] " 2>/dev/null
     iptables -A DDOS-PORTSCAN -p tcp --tcp-flags ALL NONE -j DROP
-    # XMAS scan
     iptables -A DDOS-PORTSCAN -p tcp --tcp-flags ALL ALL -j LOG --log-prefix "[DDOS-XMASSCAN] " 2>/dev/null
     iptables -A DDOS-PORTSCAN -p tcp --tcp-flags ALL ALL -j DROP
-    # FIN scan
     iptables -A DDOS-PORTSCAN -p tcp --tcp-flags ALL FIN -j LOG --log-prefix "[DDOS-FINSCAN] " 2>/dev/null
     iptables -A DDOS-PORTSCAN -p tcp --tcp-flags ALL FIN -j DROP
 
@@ -7263,26 +7278,38 @@ _ddos_enable() {
     iptables -A DDOS-RULES -m state --state INVALID -j DROP
 
     # 5. LIMIT ICMP (ping flood)
-    iptables -A DDOS-RULES -p icmp -m limit --limit 5/s -j ACCEPT
+    iptables -A DDOS-RULES -p icmp -m limit --limit ${ICMP_LIMIT}/s -j ACCEPT
     iptables -A DDOS-RULES -p icmp -j DROP
 
-    # 6. LIMIT SSH (max 10 koneksi baru per menit)
+    # 6. LIMIT SSH
     iptables -A DDOS-RULES -p tcp --dport 22 -m state --state NEW -m recent --name SSH --set
-    iptables -A DDOS-RULES -p tcp --dport 22 -m state --state NEW -m recent --name SSH --update --seconds 60 --hitcount 10 -j LOG --log-prefix "[DDOS-SSH] " 2>/dev/null
-    iptables -A DDOS-RULES -p tcp --dport 22 -m state --state NEW -m recent --name SSH --update --seconds 60 --hitcount 10 -j DROP
+    iptables -A DDOS-RULES -p tcp --dport 22 -m state --state NEW -m recent --name SSH --update --seconds ${SSH_WINDOW} --hitcount ${SSH_LIMIT} -j LOG --log-prefix "[DDOS-SSH] " 2>/dev/null
+    iptables -A DDOS-RULES -p tcp --dport 22 -m state --state NEW -m recent --name SSH --update --seconds ${SSH_WINDOW} --hitcount ${SSH_LIMIT} -j DROP
 
     # 7. LIMIT DROPBEAR
     iptables -A DDOS-RULES -p tcp --dport 222 -m state --state NEW -m recent --name DROPBEAR --set
-    iptables -A DDOS-RULES -p tcp --dport 222 -m state --state NEW -m recent --name DROPBEAR --update --seconds 60 --hitcount 10 -j DROP
+    iptables -A DDOS-RULES -p tcp --dport 222 -m state --state NEW -m recent --name DROPBEAR --update --seconds ${DROPBEAR_WINDOW} --hitcount ${DROPBEAR_LIMIT} -j DROP
 
     # Hook chain ke INPUT
     iptables -C INPUT -j DDOS-PORTSCAN 2>/dev/null || iptables -I INPUT 1 -j DDOS-PORTSCAN 2>/dev/null || true
     iptables -C INPUT -j DDOS-RULES 2>/dev/null || iptables -I INPUT 2 -j DDOS-RULES 2>/dev/null || true
 
-    # Simpan rules
+    # Simpan konfigurasi threshold + status aktif
+    cat > "$DDOS_CONFIG" << DDOSCFG
+SYN_LIMIT=${SYN_LIMIT}
+SYN_BURST=${SYN_BURST}
+CONN_LIMIT=${CONN_LIMIT}
+ICMP_LIMIT=${ICMP_LIMIT}
+SSH_LIMIT=${SSH_LIMIT}
+SSH_WINDOW=${SSH_WINDOW}
+DROPBEAR_LIMIT=${DROPBEAR_LIMIT}
+DROPBEAR_WINDOW=${DROPBEAR_WINDOW}
+ACTIVE=1
+DDOSCFG
+
+    # Simpan iptables rules
     mkdir -p /etc/iptables
-    iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > "$DDOS_CONFIG" 2>/dev/null
-    echo "active" > "$DDOS_CONFIG"
+    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
 
     # Buat systemd service untuk restore rules saat reboot
     cat > /etc/systemd/system/ddos-protection.service << 'DDOSEOF'
@@ -7303,11 +7330,10 @@ DDOSEOF
     systemctl daemon-reload 2>/dev/null
     systemctl enable ddos-protection 2>/dev/null || true
 
-    echo -e "  ${GREEN}✔ DDoS Basic Protection AKTIF!${NC}"
-    echo -e "  ${DIM}  Rules applied: SYN Flood, Port Scan, Connection Limit, ICMP Limit${NC}"
+    echo -e "  ${GREEN}DDoS Basic Protection AKTIF!${NC}"
+    echo -e "  ${DIM}  Thresholds: SYN=${SYN_LIMIT}/s, Conn=${CONN_LIMIT}/s, ICMP=${ICMP_LIMIT}/s, SSH=${SSH_LIMIT}/${SSH_WINDOW}s${NC}"
     sleep 2
 }
-
 _ddos_disable() {
     echo -e "  ${YELLOW}Menonaktifkan DDoS Protection...${NC}"
 
@@ -7329,6 +7355,68 @@ _ddos_disable() {
     rm -f "$DDOS_CONFIG"
 
     echo -e "  ${GREEN}✔ DDoS Protection dinonaktifkan!${NC}"
+    sleep 2
+}
+
+_ddos_config_menu() {
+    clear
+    print_menu_header "DDOS THRESHOLD CONFIG"
+
+    local SYN_LIMIT=20 SYN_BURST=40 CONN_LIMIT=30 ICMP_LIMIT=5
+    local SSH_LIMIT=10 SSH_WINDOW=60 DROPBEAR_LIMIT=10 DROPBEAR_WINDOW=60
+
+    if [[ -f "$DDOS_CONFIG" ]]; then
+        local cfg
+        cfg=$(cat "$DDOS_CONFIG")
+        [[ "$cfg" =~ SYN_LIMIT=([0-9]+) ]]   && SYN_LIMIT=${BASH_REMATCH[1]}
+        [[ "$cfg" =~ SYN_BURST=([0-9]+) ]]  && SYN_BURST=${BASH_REMATCH[1]}
+        [[ "$cfg" =~ CONN_LIMIT=([0-9]+) ]]  && CONN_LIMIT=${BASH_REMATCH[1]}
+        [[ "$cfg" =~ ICMP_LIMIT=([0-9]+) ]]  && ICMP_LIMIT=${BASH_REMATCH[1]}
+        [[ "$cfg" =~ SSH_LIMIT=([0-9]+) ]]   && SSH_LIMIT=${BASH_REMATCH[1]}
+        [[ "$cfg" =~ SSH_WINDOW=([0-9]+) ]]  && SSH_WINDOW=${BASH_REMATCH[1]}
+        [[ "$cfg" =~ DROPBEAR_LIMIT=([0-9]+) ]] && DROPBEAR_LIMIT=${BASH_REMATCH[1]}
+        [[ "$cfg" =~ DROPBEAR_WINDOW=([0-9]+) ]] && DROPBEAR_WINDOW=${BASH_REMATCH[1]}
+    fi
+
+    local W; W=$(get_width)
+    _box_top $W
+    _box_center $W "${YELLOW}${BOLD}CURRENT THRESHOLDS${NC}"
+    _box_divider $W
+    printf "  ${WHITE}1.${NC} SYN Flood Limit      : ${CYAN}%d/s${NC} (burst: %d)\n" $SYN_LIMIT $SYN_BURST
+    printf "  ${WHITE}2.${NC} Connection Limit     : ${CYAN}%d/s${NC}\n" $CONN_LIMIT
+    printf "  ${WHITE}3.${NC} ICMP/Ping Limit      : ${CYAN}%d/s${NC}\n" $ICMP_LIMIT
+    printf "  ${WHITE}4.${NC} SSH Limit            : ${CYAN}%d/%ds${NC}\n" $SSH_LIMIT $SSH_WINDOW
+    printf "  ${WHITE}5.${NC} Dropbear Limit       : ${CYAN}%d/%ds${NC}\n" $DROPBEAR_LIMIT $DROPBEAR_WINDOW
+    _box_divider $W
+    echo -e "  ${YELLOW}Pilih nomor untuk mengubah, [r] Reset default, [0] Kembali${NC}"
+    echo ""
+    read -rp "  Pilihan: " cfg_choice
+
+    case $cfg_choice in
+        1) read -rp "  SYN Limit (/s): " v; [[ "$v" =~ ^[0-9]+$ ]] && sed -i "s/SYN_LIMIT=.*/SYN_LIMIT=$v/" "$DDOS_CONFIG" 2>/dev/null
+           read -rp "  SYN Burst: " v2; [[ "$v2" =~ ^[0-9]+$ ]] && sed -i "s/SYN_BURST=.*/SYN_BURST=$v2/" "$DDOS_CONFIG" 2>/dev/null ;;
+        2) read -rp "  Connection Limit (/s): " v; [[ "$v" =~ ^[0-9]+$ ]] && sed -i "s/CONN_LIMIT=.*/CONN_LIMIT=$v/" "$DDOS_CONFIG" 2>/dev/null ;;
+        3) read -rp "  ICMP Limit (/s): " v; [[ "$v" =~ ^[0-9]+$ ]] && sed -i "s/ICMP_LIMIT=.*/ICMP_LIMIT=$v/" "$DDOS_CONFIG" 2>/dev/null ;;
+        4) read -rp "  SSH Limit (koneksi): " v; [[ "$v" =~ ^[0-9]+$ ]] && sed -i "s/SSH_LIMIT=.*/SSH_LIMIT=$v/" "$DDOS_CONFIG" 2>/dev/null
+           read -rp "  SSH Window (detik): " v2; [[ "$v2" =~ ^[0-9]+$ ]] && sed -i "s/SSH_WINDOW=.*/SSH_WINDOW=$v2/" "$DDOS_CONFIG" 2>/dev/null ;;
+        5) read -rp "  Dropbear Limit (koneksi): " v; [[ "$v" =~ ^[0-9]+$ ]] && sed -i "s/DROPBEAR_LIMIT=.*/DROPBEAR_LIMIT=$v/" "$DDOS_CONFIG" 2>/dev/null
+           read -rp "  Dropbear Window (detik): " v2; [[ "$v2" =~ ^[0-9]+$ ]] && sed -i "s/DROPBEAR_WINDOW=.*/DROPBEAR_WINDOW=$v2/" "$DDOS_CONFIG" 2>/dev/null ;;
+        r|R)
+            cat > "$DDOS_CONFIG" << DDOSCFG
+SYN_LIMIT=20
+SYN_BURST=40
+CONN_LIMIT=30
+ICMP_LIMIT=5
+SSH_LIMIT=10
+SSH_WINDOW=60
+DROPBEAR_LIMIT=10
+DROPBEAR_WINDOW=60
+ACTIVE=1
+DDOSCFG
+            echo -e "  ${GREEN}Threshold direset ke default!${NC}" ;;
+        0|*) return ;;
+    esac
+    echo -e "  ${GREEN}Updated! Jalankan [Aktifkan Ulang] agar efek.${NC}"
     sleep 2
 }
 
@@ -7443,6 +7531,11 @@ _traffic_enable() {
 
     # Buat direktori cache
     mkdir -p "$TRAFFIC_DIR"
+    # Buat cron untuk auto-save traffic counters setiap jam
+    if ! crontab -l 2>/dev/null | grep -q "traffic_save"; then
+        (crontab -l 2>/dev/null; echo "0 * * * * iptables -L TRAFFIC-IN -n -v 2>/dev/null > "$TRAFFIC_DIR"/save_in.txt; iptables -L TRAFFIC-OUT -n -v 2>/dev/null > "$TRAFFIC_DIR"/save_out.txt") | crontab - 2>/dev/null
+    fi
+
 
     echo -e "  ${GREEN}✔ Traffic Monitor AKTIF!${NC}"
     echo -e "  ${DIM}  Monitoring: SSH, Dropbear, HTTP/HTTPS, Xray, BadVPN${NC}"
@@ -7459,12 +7552,16 @@ _traffic_disable() {
     iptables -X TRAFFIC-IN 2>/dev/null || true
     iptables -X TRAFFIC-OUT 2>/dev/null || true
 
+    # Hapus cron auto-save
+    if crontab -l 2>/dev/null | grep -q "traffic_save"; then
+        crontab -l 2>/dev/null | grep -v "traffic_save" | crontab - 2>/dev/null || true
+    fi
+
     rm -rf "$TRAFFIC_DIR" 2>/dev/null
 
-    echo -e "  ${GREEN}✔ Traffic Monitor dinonaktifkan!${NC}"
+    echo -e "  ${GREEN}Traffic Monitor dinonaktifkan!${NC}"
     sleep 2
 }
-
 _traffic_show_total() {
     clear
     print_menu_header "TOTAL TRAFFIC SERVER"
