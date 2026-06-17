@@ -53,6 +53,9 @@ CHAT_ID_FILE="/root/.chat_id"
 ORDER_DIR="/root/orders"
 PAYMENT_FILE="/root/.payment_info"
 DOMAIN_TYPE_FILE="/root/.domain_type"
+SYSTEM_INFO_CACHE="/root/.sysinfo_cache"
+IP_CACHE_TTL=600
+SYSINFO_CACHE_TTL=30
 
 # TunnelBot Multi-VPS
 TUNNELBOT_DIR="/opt/.sysd"
@@ -351,15 +354,21 @@ show_install_banner() {
 check_status() { systemctl is-active --quiet "$1" 2>/dev/null && echo "ON" || echo "OFF"; }
 
 get_ip() {
-    # Hapus cache lama jika ada, biar selalu fresh
+    # Cache dengan TTL 10 menit — lebih agresif
     if [ -f "$IP_CACHE_FILE" ]; then
-        local cached; cached=$(tr -d '[:space:]' < "$IP_CACHE_FILE")
-        # Validasi cached: cek format IPv4 valid
-        if echo "$cached" | grep -qE '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$'; then
-            for octet in $(echo "$cached" | tr '.' ' '); do
-                [ $((10#$octet)) -gt 255 ] && { cached=""; break; }
-            done
-            [ -n "$cached" ] && { echo "$cached"; return; }
+        local cached cached_time now
+        cached=$(tr -d '[:space:]' < "$IP_CACHE_FILE")
+        # Ambil timestamp dari mtime file
+        cached_time=$(stat -c %Y "$IP_CACHE_FILE" 2>/dev/null || echo 0)
+        now=$(date +%s)
+        # Jika cache masih fresh (< 10 menit) dan valid, pakai
+        if [ $((now - cached_time)) -lt "$IP_CACHE_TTL" ]; then
+            if echo "$cached" | grep -qE '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$'; then
+                for octet in $(echo "$cached" | tr '.' ' '); do
+                    [ $((10#$octet)) -gt 255 ] && { cached=""; break; }
+                done
+                [ -n "$cached" ] && { echo "$cached"; return; }
+            fi
         fi
     fi
     local ip
@@ -422,33 +431,106 @@ print_section() {
 # DASHBOARD — TAMPILAN UTAMA
 #================================================
 
+# Baca CPU dari /proc/stat (jauh lebih cepat dari top -bn1)
+_get_cpu_usage() {
+    local idle1 total1 idle2 total2 diff_idle diff_total
+    read -r _ < /proc/stat  # skip first line or parse
+    # Baca total dan idle dari baris pertama /proc/stat
+    local cpu_line
+    cpu_line=$(head -1 /proc/stat 2>/dev/null || echo "cpu 0 0 0 0 0 0 0 0 0 0")
+    # user nice system idle iowait irq softirq steal guest guest_nice
+    set -- $cpu_line
+    shift # remove 'cpu'
+    total1=$(( $1 + $2 + $3 + $4 + $5 + $6 + $7 + $8 ))
+    idle1=$4
+    sleep 0.1
+    cpu_line=$(head -1 /proc/stat 2>/dev/null || echo "cpu 0 0 0 0 0 0 0 0 0 0")
+    set -- $cpu_line
+    shift
+    total2=$(( $1 + $2 + $3 + $4 + $5 + $6 + $7 + $8 ))
+    idle2=$4
+    diff_idle=$(( idle2 - idle1 ))
+    diff_total=$(( total2 - total1 ))
+    if [ $diff_total -gt 0 ]; then
+        echo $(( (100 * (diff_total - diff_idle)) / diff_total ))
+    else
+        echo "0"
+    fi
+}
+
+# Batch systemctl check — 1 panggilan untuk semua service
+_get_services_status() {
+    if command -v systemctl >/dev/null 2>&1; then
+        # Dapatkan semua service aktif dalam 1 panggilan
+        local active_units
+        active_units=$(systemctl list-units --type=service --state=running --no-legend --no-pager 2>/dev/null | awk '{print $1}' | tr '\n' '|')
+        echo "$active_units"
+    fi
+}
+
 show_system_info() {
     clear
     [ -f "$DOMAIN_FILE" ] && DOMAIN=$(tr -d '\n\r' < "$DOMAIN_FILE" | xargs)
+
+    # ── CACHE CHECK: refresh hanya jika cache sudah expired ──
+    local use_cache=0
+    if [ -f "$SYSTEM_INFO_CACHE" ]; then
+        local cache_time now
+        cache_time=$(stat -c %Y "$SYSTEM_INFO_CACHE" 2>/dev/null || echo 0)
+        now=$(date +%s)
+        [ $((now - cache_time)) -lt "$SYSINFO_CACHE_TTL" ] && use_cache=1
+    fi
 
     local os_name="Unknown"
     [ -f /etc/os-release ] && { . /etc/os-release; os_name="${PRETTY_NAME}"; }
 
     local ip_vps ram_used ram_total ram_pct cpu uptime_str ssl_type svc_running svc_total
-    ip_vps=$(get_ip)
-    ram_used=$(free -m | awk '/Mem:/{print $3}')
-    ram_total=$(free -m | awk '/Mem:/{print $2}')
-    ram_pct=$(awk "BEGIN{printf \"%.0f\",($ram_used/$ram_total)*100}")
-    cpu=$(top -bn1 2>/dev/null | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1 || echo "0")
-    uptime_str=$(uptime -p 2>/dev/null | sed 's/up //' | sed 's/ hours\?/h/g;s/ minutes\?/m/g')
 
-    local domain_type="custom"
-    [ -f "$DOMAIN_TYPE_FILE" ] && domain_type=$(cat "$DOMAIN_TYPE_FILE")
-    if [ "$domain_type" = "custom" ]; then
-        [ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ] \
-            && ssl_type="LetsEncrypt (Active)" || ssl_type="LetsEncrypt (Warn)"
-    else
-        ssl_type="Self-Signed"
+    if [ $use_cache -eq 1 ]; then
+        # Baca dari cache
+        local cached_data
+        cached_data=$(cat "$SYSTEM_INFO_CACHE" 2>/dev/null || echo "")
+        if [ -n "$cached_data" ]; then
+            eval "$cached_data"
+        else
+            use_cache=0
+        fi
     fi
 
-    local svcs=(xray nginx ssh haproxy dropbear udp-custom zivpn-udp vpn-keepalive vpn-bot)
-    svc_total=${#svcs[@]}; svc_running=0
-    for s in "${svcs[@]}"; do systemctl is-active --quiet "$s" 2>/dev/null && svc_running=$((svc_running+1)); done
+    if [ $use_cache -eq 0 ]; then
+        # Kumpulkan data (hanya sekali setiap 30 detik)
+        ip_vps=$(get_ip)
+        ram_used=$(free -m | awk '/Mem:/{print $3}')
+        ram_total=$(free -m | awk '/Mem:/{print $2}')
+        ram_pct=$(awk "BEGIN{printf \"%.0f\",($ram_used/$ram_total)*100}")
+        cpu=$(_get_cpu_usage)
+        uptime_str=$(uptime -p 2>/dev/null | sed 's/up //' | sed 's/ hours\?/h/g;s/ minutes\?/m/g')
+
+        local domain_type="custom"
+        [ -f "$DOMAIN_TYPE_FILE" ] && domain_type=$(cat "$DOMAIN_TYPE_FILE")
+        if [ "$domain_type" = "custom" ]; then
+            [ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ] \
+                && ssl_type="LetsEncrypt (Active)" || ssl_type="LetsEncrypt (Warn)"
+        else
+            ssl_type="Self-Signed"
+        fi
+
+        # Batch systemctl: 1 panggilan untuk semua service
+        local active_units
+        active_units=$(_get_services_status)
+        local svcs=(xray nginx ssh haproxy dropbear udp-custom zivpn-udp vpn-keepalive vpn-bot)
+        svc_total=${#svcs[@]}; svc_running=0
+        for s in "${svcs[@]}"; do
+            if echo "$active_units" | grep -q "${s}\.service|"; then
+                svc_running=$((svc_running+1))
+            fi
+        done
+
+        # Cache hasil ke file
+        printf "ip_vps='%s'\nram_used='%s'\nram_total='%s'\nram_pct='%s'\ncpu='%s'\nuptime_str='%s'\nssl_type='%s'\nsvc_total='%s'\nsvc_running='%s'\n" \
+            "$ip_vps" "$ram_used" "$ram_total" "$ram_pct" "$cpu" "$uptime_str" "$ssl_type" "$svc_total" "$svc_running" \
+            > "$SYSTEM_INFO_CACHE" 2>/dev/null
+    fi
 
     local ssh_count vmess_count vless_count trojan_count
     ssh_count=$(ls "$AKUN_DIR"/ssh-*.txt 2>/dev/null | wc -l)
@@ -492,26 +574,31 @@ show_system_info() {
 
     # ── NETWORK SERVICES ──
     local xs xn hs dn ss un ks bt fb cj fw
-    systemctl is-active --quiet xray          2>/dev/null && xs="${GREEN}● ONLINE${NC}" || xs="${RED}○ OFFLINE${NC}"
-    systemctl is-active --quiet nginx         2>/dev/null && xn="${GREEN}● ONLINE${NC}" || xn="${RED}○ OFFLINE${NC}"
-    systemctl is-active --quiet haproxy       2>/dev/null && hs="${GREEN}● ONLINE${NC}" || hs="${RED}○ OFFLINE${NC}"
-    systemctl is-active --quiet dropbear      2>/dev/null && dn="${GREEN}● ONLINE${NC}" || dn="${RED}○ OFFLINE${NC}"
+    local active_units
+    active_units=$(_get_services_status)
+    local _svc_on() { echo "$active_units" | grep -q "${1}\.service|"; }
+    _svc_on xray          && xs="${GREEN}● ONLINE${NC}" || xs="${RED}○ OFFLINE${NC}"
+    _svc_on nginx         && xn="${GREEN}● ONLINE${NC}" || xn="${RED}○ OFFLINE${NC}"
+    _svc_on haproxy       && hs="${GREEN}● ONLINE${NC}" || hs="${RED}○ OFFLINE${NC}"
+    _svc_on dropbear      && dn="${GREEN}● ONLINE${NC}" || dn="${RED}○ OFFLINE${NC}"
     local ssh_svc_name; ssh_svc_name=$(get_ssh_service_name)
-    systemctl is-active --quiet "$ssh_svc_name" 2>/dev/null && ss="${GREEN}● ONLINE${NC}" || ss="${RED}○ OFFLINE${NC}"
-    systemctl is-active --quiet udp-custom    2>/dev/null && un="${GREEN}● ONLINE${NC}" || un="${RED}○ OFFLINE${NC}"
-    systemctl is-active --quiet vpn-keepalive 2>/dev/null && ks="${GREEN}● ONLINE${NC}" || ks="${RED}○ OFFLINE${NC}"
-    # Bot Telegram user (cek token ada + service running)
-    if [[ -f "$BOT_TOKEN_FILE" ]] && systemctl is-active --quiet vpn-bot 2>/dev/null; then
+    _svc_on "$ssh_svc_name" && ss="${GREEN}● ONLINE${NC}" || ss="${RED}○ OFFLINE${NC}"
+    _svc_on udp-custom    && un="${GREEN}● ONLINE${NC}" || un="${RED}○ OFFLINE${NC}"
+    _svc_on vpn-keepalive && ks="${GREEN}● ONLINE${NC}" || ks="${RED}○ OFFLINE${NC}"
+    # Bot Telegram
+    if [[ -f "$BOT_TOKEN_FILE" ]] && _svc_on vpn-bot; then
         bt="${GREEN}● ONLINE${NC}"
     elif [[ -f "$BOT_TOKEN_FILE" ]]; then
         bt="${YELLOW}● CONFIG${NC}"
     else
         bt="${RED}○ OFFLINE${NC}"
     fi
-    # Fail2ban
-    command -v fail2ban-client >/dev/null 2>&1 && \
-        systemctl is-active --quiet fail2ban 2>/dev/null && \
-        fb="${GREEN}● ONLINE${NC}" || fb="${RED}○ OFFLINE${NC}"
+    # Fail2ban - langsung grep dari active_units
+    if echo "$active_units" | grep -q "fail2ban\.service|"; then
+        fb="${GREEN}● ONLINE${NC}"
+    else
+        fb="${RED}○ OFFLINE${NC}"
+    fi
     # Cron auto-delete expired
     crontab -l 2>/dev/null | grep -q "delete_expired_cron" && \
         cj="${GREEN}● ONLINE${NC}" || cj="${RED}○ OFFLINE${NC}"
@@ -7084,6 +7171,7 @@ CREDEOF
 
 main_menu() {
     while true; do
+        printf "\r  ${CYAN}⣾${NC} ${WHITE}Loading system info...${NC}   "
         show_system_info
         show_menu
         printf "${YELLOW}${BOLD}➤ ENTER OPTION [0-21] : ${NC}"
