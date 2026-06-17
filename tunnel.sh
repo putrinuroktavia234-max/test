@@ -650,10 +650,9 @@ show_menu() {
     printf "  %b%${lpad}s%b%${rpad}s\n" "$left" "" "$right" ""
     }
     _mrow1() {
-        # 1 kolom tengah
-        local c=$1 n1="$2" lb1="$3"
-        local text="${CYAN}[${n1}]${NC} ${WHITE}${lb1}${NC}"
-        _box_center $W "$text"
+        # 1 kolom kiri — rata kiri seperti _mrow
+        local n1="$2" lb1="$3"
+        printf "  ${CYAN}[${n1}]${NC} ${WHITE}${lb1}${NC}\n"
     }
 
     # ── ACCOUNT MANAGEMENT ──
