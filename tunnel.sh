@@ -814,10 +814,11 @@ PROFILEEOF
             /# VPN Panel Auto-Start/ { skip=1 }
             skip && /^fi[[:space:]]*$/ { skip=0; next }
             !skip { print }
-        ' /root/.bashrc > /tmp/_bashrc_clean.tmp 2>/dev/null
+        ' /root/.bashrc > /tmp/_bashrc_clean.tmp 2>/dev/null && \
         grep -v -E 'tunnel\.sh|VPN_MENU_RUNNING|mesg n 2>|# VPN Panel' \
-            /tmp/_bashrc_clean.tmp > /tmp/_bashrc_clean2.tmp 2>/dev/null
+            /tmp/_bashrc_clean.tmp > /tmp/_bashrc_clean2.tmp 2>/dev/null && \
         mv /tmp/_bashrc_clean2.tmp /root/.bashrc
+        rm -f /tmp/_bashrc_clean.tmp /tmp/_bashrc_clean2.tmp 2>/dev/null || true
     fi
     # Tulis entri baru di .bashrc
     if ! grep -q "VPN Panel Auto-Start" /root/.bashrc 2>/dev/null; then
